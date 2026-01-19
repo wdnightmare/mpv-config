@@ -1006,4 +1006,3 @@ For more simple addons that make a few small modifications to how other parsers 
 For more complex addons that maintain their own virtual directory structure, see
 [favourites](../addons/favourites.lua).
 
-
