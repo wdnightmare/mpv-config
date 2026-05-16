@@ -79,9 +79,13 @@ local o = {
     mode = "manual",
     -- eng=English, chs=Chinese Simplified
     language = 'eng',
-    timeout = 15,
+    timeout = 20,
     categories = "",
     skip = "",
+    enable_position_inference = true,
+    enable_history_position_inference = false,
+    intro_time_window = 200,
+    outro_time_window = 300,
     silence_audio_level = -40,
     silence_duration = 0.7,
     ignore_silence_duration=1,
@@ -89,6 +93,21 @@ local o = {
     max_skip_duration = 120,
     force_mute_on_skip = false,
     history_path = "~~/chapterskip_history.json",
+    -- Button styling
+    button_font_size = 24,
+    button_padding_x = 20,
+    button_padding_y = 15,
+    button_margin = 60,
+    button_border = 2,
+    button_radius = 13,
+    -- Button colors (BGR format: BBGGRR)
+    button_progress_color = "2442F4",
+    button_progress_hover_color = "2442F4",
+    button_remaining_color = "FFFFFF",
+    button_remaining_hover_color = "111111",
+    button_text_color = "000000",
+    button_text_hover_color = "FFFFFF",
+    button_border_color = "FFFFFF",
 }
 
 options.read_options(o, _, function() end)
@@ -108,41 +127,34 @@ local parsed = {}
 local chapter_skip = {}
 local active_skips = {}
 local skip_prompt_queue = {}
-local confirm_timer = nil
 local skip_timer = nil
 local history_path = mp.command_native({ "expand-path", o.history_path })
 
 local locals = {
     ['eng'] = {
-        skip_detected = 'A skippable segment has been detected.',
-        skip_confirm  = 'Do you want to skip it?',
-        countdown     = 'Time remaining: %d seconds',
+        skip_detected = 'Skip Segment',
         auto_skip     = 'Auto-skip: %s-%s',
         chapter_mode  = 'Chapter skip mode: ',
-        skipping_chapter = 'Skipping chapter: ',
         mark_fragment_empty = 'Mark fragment is empty',
         mark_start_pos = 'Marked %s as start position',
         mark_fragment = 'Mark skip fragment: %s-%s',
         no_audio = 'No audio stream detected',
         skipped_to_silence = 'Skipped to silence at %s',
-        skip_cancel_min = 'Skipping Cancelled\nSilence is less than configured minimum',
-        skip_cancel_max = 'Skipping Cancelled\nSilence is more than configured maximum',
+        skip_cancel_min = 'Skipping Cancelled - Silence is less than configured minimum',
+        skip_cancel_max = 'Skipping Cancelled - Silence is more than configured maximum',
         failed_timestamp = 'Failed to get timestamp'
     },
     ['chs'] = {
-        skip_detected = '检测到可跳过的片段',
-        skip_confirm  = '是否跳过该片段？',
-        countdown     = '倒计时：%d 秒',
-        auto_skip     = '自动跳过: %s-%s',
+        skip_detected = '跳过片段',
+        auto_skip     = '已跳过: %s-%s',
         chapter_mode  = '跳过章节模式: ',
-        skipping_chapter = '跳过章节: ',
         mark_fragment_empty = '标记片段为空',
         mark_start_pos = '标记 %s 为起始位置',
         mark_fragment = '标记跳过片段: %s-%s',
         no_audio = '未检测到音频流',
         skipped_to_silence = '已跳过到静音点 %s',
-        skip_cancel_min = '取消跳过\n静音时长低于最小值',
-        skip_cancel_max = '取消跳过\n静音时长超过最大值',
+        skip_cancel_min = '取消跳过 - 静音时长低于最小值',
+        skip_cancel_max = '取消跳过 - 静音时长超过最大值',
         failed_timestamp = '获取时间戳失败'
     }
 }
@@ -159,18 +171,19 @@ end
 
 local function url_decode(str)
     if str ~= nil then
-        str = str:gsub("^%a[%a%d-_]+://", "")
-              :gsub("^%a[%a%d-_]+:\\?", "")
-              :gsub("%%(%x%x)", hex_to_char)
-        if str:find("://localhost:?") then
-            str = str:gsub("^.*/", "")
+        str = str:gsub('^%a[%a%d-_]+://', '')
+              :gsub('^%a[%a%d-_]+:\\?', '')
+              :gsub('%%(%x%x)', hex_to_char)
+        if str:find('://localhost:?') then
+            str = str:gsub('^.*/', '')
         end
-        str = str:gsub("%?.+", "")
-              :gsub("%+", " ")
-        return str
-    else
-        return
+        str = str:gsub("%?.+", ""):gsub("%+", " ")
+        local last_pos = str:match('.*[\\/:%?]()')
+        if last_pos then
+            str = str:sub(last_pos)
+        end
     end
+    return str
 end
 
 local function timestamp(duration)
@@ -321,7 +334,280 @@ local function info(s)
     show_message(s, 2)
 end
 
-local function matches(i, title)
+-- Button UI state
+local button_state = {
+    overlay = nil,
+    visible = false,
+    message = "",
+    mouse_hover = false,
+    countdown_timer = nil,
+    countdown_remaining = 0,
+    countdown_total = 0,
+    action = nil,
+    skip_obj = nil,
+}
+
+-- Forward declarations
+local hide_button
+local render_button
+local bind_button_click
+local unbind_button_click
+
+-- Initialize button overlay
+local function init_button_overlay()
+    if not button_state.overlay then
+        button_state.overlay = mp.create_osd_overlay("ass-events")
+        if button_state.overlay then
+            button_state.overlay.z = 2000  -- Set high z-index to ensure visibility
+        end
+    end
+end
+
+-- Mouse position helper
+local function is_mouse_in_button(bx, by, bw, bh, mx, my)
+    return mx >= bx and mx <= bx + bw and my >= by and my <= by + bh
+end
+
+-- Render button with progress
+render_button = function()
+    if not button_state.visible then
+        return
+    end
+    init_button_overlay()
+
+    -- Get display size using osd-dimensions (same as notify_skip)
+    local dims = mp.get_property_native("osd-dimensions")
+    local screen_width, screen_height
+    if dims then
+        screen_width = dims.w
+        screen_height = dims.h
+    else
+        screen_width = 1920
+        screen_height = 1080
+    end
+
+    -- Calculate scale (same as notify_skip)
+    local scale = screen_height / 1080
+    local button_padding_x = o.button_padding_x * scale
+    local button_padding_y = o.button_padding_y * scale
+    local font_size = o.button_font_size * scale
+    local hint_font_size = font_size * 0.9  -- Smaller font for hint
+
+    -- Calculate button dimensions with hint text
+    local message_width = #button_state.message * font_size * 0.6
+    local hint_text = "[y/n]"
+    local hint_width = #hint_text * hint_font_size * 0.6
+    local max_text_width = math.max(message_width, hint_width)
+    local button_width = max_text_width + button_padding_x * 2
+    local line_spacing = font_size * 0.1
+    local button_height = font_size + line_spacing + hint_font_size + button_padding_y * 2
+
+    -- Position button: bottom right, same as notify_skip
+    local margin = o.button_margin * scale
+    local button_x = screen_width - button_width - margin
+    local button_y = screen_height - button_height - margin - (80 * scale)
+
+    -- Check mouse hover (same method as notify_skip)
+    local pos = mp.get_property_native("mouse-pos")
+    local mouse_x, mouse_y, mouse_hover
+    if pos then
+        mouse_x = pos.x
+        mouse_y = pos.y
+        mouse_hover = pos.hover
+    else
+        mouse_x = 0
+        mouse_y = 0
+        mouse_hover = false
+    end
+    local is_hover = mouse_hover and is_mouse_in_button(button_x, button_y, button_width, button_height, mouse_x, mouse_y)
+    button_state.mouse_hover = is_hover
+
+    -- Colors
+    local text_color = is_hover and o.button_text_hover_color or o.button_text_color
+    local border_color = o.button_border_color
+
+    -- Calculate progress
+    local progress = 0
+    if button_state.countdown_total > 0 and button_state.countdown_remaining > 0 then
+        progress = 1 - (button_state.countdown_remaining / button_state.countdown_total)
+    elseif button_state.countdown_remaining == 0 then
+        progress = 1
+    end
+
+    local progress_color = is_hover and o.button_progress_hover_color or o.button_progress_color
+    local remaining_color = is_hover and o.button_remaining_hover_color or o.button_remaining_color
+
+    local ass = assdraw.ass_new()
+    ass:new_event()
+    ass:pos(0, 0)
+    ass:append("{\\blur0\\bord0\\1c&HFFFFFF&\\3c&HFFFFFF&}")
+
+    -- Draw border
+    ass:draw_start()
+    ass:append("{\\1c&H000000&\\3c&H" .. border_color .. "&\\bord" .. (o.button_border * scale) .. "}")
+    ass:round_rect_cw(button_x, button_y, button_x + button_width, button_y + button_height, o.button_radius * scale)
+    ass:draw_stop()
+
+    -- Draw progress fill (left part)
+    if progress > 0 then
+        local progress_width = button_width * progress
+        ass:new_event()
+        ass:pos(0, 0)
+        ass:append("{\\blur0\\bord0}")
+        ass:draw_start()
+        ass:append("{\\1c&H" .. progress_color .. "&}")
+        if progress >= 1 then
+            ass:round_rect_cw(button_x, button_y, button_x + button_width, button_y + button_height, o.button_radius * scale)
+        else
+            ass:round_rect_cw(button_x, button_y, button_x + progress_width, button_y + button_height, o.button_radius * scale, 0)
+        end
+        ass:draw_stop()
+    end
+
+    -- Draw remaining fill (right part)
+    if progress < 1 then
+        local progress_width = button_width * progress
+        ass:new_event()
+        ass:pos(0, 0)
+        ass:append("{\\blur0\\bord0}")
+        ass:draw_start()
+        ass:append("{\\1c&H" .. remaining_color .. "&}")
+        if progress > 0 then
+            ass:round_rect_cw(button_x + progress_width, button_y, button_x + button_width, button_y + button_height, 0, o.button_radius * scale)
+        else
+            ass:round_rect_cw(button_x, button_y, button_x + button_width, button_y + button_height, o.button_radius * scale)
+        end
+        ass:draw_stop()
+    end
+
+    -- Draw text (main message)
+    local text_x = button_x + button_width / 2
+    local text_y = button_y + button_height / 2 - (hint_font_size + line_spacing) / 2
+    ass:new_event()
+    ass:append("{\\an5\\fs" .. font_size .. "\\b1\\bord0\\shad0\\1c&H" .. text_color .. "&}")
+    ass:pos(text_x, text_y)
+    ass:append(button_state.message)
+
+    -- Draw keyboard hint (second line)
+    local hint_y = text_y + font_size / 2 + line_spacing + hint_font_size / 2
+    ass:new_event()
+    ass:append("{\\an5\\fs" .. hint_font_size .. "\\b0\\bord0\\shad0\\1c&H" .. text_color .. "&\\alpha&H80&}")
+    ass:pos(text_x, hint_y)
+    ass:append(hint_text)
+
+    local ass_text = ass.text
+
+    -- Set overlay resolution and data
+    button_state.overlay.res_x = screen_width
+    button_state.overlay.res_y = screen_height
+    button_state.overlay.data = ass_text
+    button_state.overlay:update()
+end
+
+-- Bind/unbind button click
+bind_button_click = function()
+    mp.add_forced_key_binding("MBTN_LEFT", "chapterskip-button-click", function()
+        local pos = mp.get_property_native("mouse-pos")
+        if not pos then return end
+
+        if button_state.mouse_hover then
+            -- Clicked on button
+            if button_state.action then
+                button_state.action()
+            end
+            hide_button()
+        else
+            -- Clicked outside - cancel
+            hide_button()
+        end
+    end)
+end
+
+unbind_button_click = function()
+    mp.remove_key_binding("chapterskip-button-click")
+end
+
+-- Mouse move handler
+local function handle_button_mouse_move()
+    if button_state.visible then
+        render_button()
+    end
+end
+
+-- Hide button
+hide_button = function()
+    if button_state.countdown_timer then
+        button_state.countdown_timer:kill()
+        button_state.countdown_timer = nil
+    end
+
+    button_state.visible = false
+    button_state.message = ""
+    button_state.action = nil
+    button_state.skip_obj = nil
+    button_state.countdown_remaining = 0
+    button_state.countdown_total = 0
+
+    if button_state.overlay then
+        button_state.overlay:remove()
+    end
+
+    unbind_button_click()
+
+    -- Remove keyboard shortcuts
+    mp.remove_key_binding("chapterskip-confirm")
+    mp.remove_key_binding("chapterskip-cancel")
+end
+
+-- Show button with countdown
+local function show_button(message, action, skip_obj)
+    hide_button()  -- Clear any existing button
+
+    button_state.visible = true
+    button_state.message = message
+    button_state.action = action
+    button_state.skip_obj = skip_obj
+    button_state.countdown_remaining = o.timeout
+    button_state.countdown_total = o.timeout
+
+    render_button()
+
+    bind_button_click()
+
+    -- Add keyboard shortcuts for confirm/cancel
+    mp.add_forced_key_binding("y", "chapterskip-confirm", function()
+        if button_state.action then
+            button_state.action()
+        end
+        hide_button()
+    end)
+
+    mp.add_forced_key_binding("n", "chapterskip-cancel", function()
+        if button_state.skip_obj then
+            button_state.skip_obj.cancelled = true
+        end
+        hide_button()
+    end)
+
+    if o.timeout > 0 then
+        button_state.countdown_timer = mp.add_periodic_timer(1, function()
+            button_state.countdown_remaining = button_state.countdown_remaining - 1
+            if button_state.countdown_remaining <= 0 then
+                if skip_obj then skip_obj.cancelled = true end
+                hide_button()
+            else
+                render_button()
+            end
+        end)
+    end
+end
+
+-- Register mouse move observer
+mp.observe_property("mouse-pos", "native", handle_button_mouse_move)
+
+-- Check if chapter matches skip pattern (title-based or position-based)
+local function matches(i, title, chapter_time, chapter_duration, total_chapters, duration)
+    -- First, try title-based matching
     for category in string.gmatch(o.skip, " *([^;]*[^; ]) *") do
         if categories[category:lower()] then
             if string.find(category:lower(), "^idx%-") == nil then
@@ -404,7 +690,7 @@ local function cache_skip()
     end
 
     if not matched then
-        if state.start >= 90 or state.ended - state.start > 120 then
+        if state.start > 100 or state.ended - state.start > 120 then
             return
         elseif state.start <= 30 then
             state.start = 0
@@ -417,13 +703,7 @@ local function cache_skip()
 end
 
 function cancel_skip_prompt()
-    if confirm_timer then
-        confirm_timer:kill()
-        confirm_timer = nil
-    end
-    mp.remove_key_binding("skip-confirm")
-    mp.remove_key_binding("skip-cancel")
-    show_message("", 0)
+    hide_button()
 
     if #skip_prompt_queue > 0 then
         local next_prompt = table.remove(skip_prompt_queue, 1)
@@ -437,43 +717,32 @@ function confirm_skip_prompt(action)
 end
 
 function show_skip_prompt(action, skip_obj)
-    if confirm_timer then
+    if button_state.visible then
         table.insert(skip_prompt_queue, {action = action, skip_obj = skip_obj})
         return
     end
 
-    local countdown = o.timeout
-    local function update_msg()
-        if not confirm_timer or not confirm_timer:is_enabled() then
-            return
-        end
-
-        local yn_text = "{\\c&H00FFFF&}[y/n]{\\c&HFFFFFF&}"
-        show_message(
-            texts.skip_detected .. " " .. (skip_obj.title or "") .. "\n" ..
-            texts.skip_confirm .. " " .. yn_text .. "\n" ..
-            texts.countdown:format(countdown),
-            1,
-            "FFFF00"
-        )
-
-        countdown = countdown - 1
-        if countdown < 0 then
-            if skip_obj then skip_obj.cancelled = true end
-            cancel_skip_prompt()
+    -- Generate message based on category
+    local message = texts.skip_detected
+    if skip_obj and skip_obj.category then
+        if o.language == "chs" then
+            -- Chinese category names with Chinese "跳过" prefix
+            local category_names = {
+                opening = "片头",
+                ending = "片尾",
+                credits = "Staff",
+                prologue = "序章",
+                preview = "预告"
+            }
+            local category_display = category_names[skip_obj.category] or skip_obj.category
+            message = "跳过" .. category_display
+        else
+            local category_display = skip_obj.category:gsub("^%l", string.upper)
+            message = "Skip " .. category_display
         end
     end
 
-    update_msg()
-    confirm_timer = mp.add_periodic_timer(1, update_msg)
-
-    mp.add_forced_key_binding("y", "skip-confirm", function()
-        confirm_skip_prompt(action)
-    end)
-    mp.add_forced_key_binding("n", "skip-cancel", function()
-        if skip_obj then skip_obj.cancelled = true end
-        cancel_skip_prompt()
-    end)
+    show_button(message, action, skip_obj)
 end
 
 local function start_skip_watcher()
@@ -524,7 +793,7 @@ local function start_skip_watcher()
             end
         end
 
-        if #active_skips == 0 then
+        if #active_skips == 0 and skip_timer then
             skip_timer:kill()
             skip_timer = nil
         end
@@ -537,7 +806,13 @@ local function add_active_skip(s)
             return
         end
     end
-    table.insert(active_skips, { start = s.start, ended = s.ended, title = s.title, triggered = false })
+    table.insert(active_skips, {
+        start = s.start,
+        ended = s.ended,
+        title = s.title,
+        category = s.category,
+        triggered = false
+    })
     start_skip_watcher()
 end
 
@@ -553,15 +828,62 @@ local function chapterskip(_, current)
         parsed[category] = true
     end
     local chapters = mp.get_property_native("chapter-list")
+    local duration = mp.get_property_number("duration") or 0
+    local total_chapters = #chapters or 0
+
+    if duration <= o.intro_time_window or total_chapters <= 1 then return end
+
+    local matches_info = {}
     for i, chapter in ipairs(chapters) do
-        if not skipped[i] and matches(i, chapter.title) then
+        -- Calculate chapter duration
+        local chapter_duration = 0
+        if chapters[i + 1] then
+            chapter_duration = chapters[i + 1].time - chapter.time
+        elseif duration > 0 then
+            chapter_duration = duration - chapter.time
+        end
+
+        local is_match, match_type, category = matches(i, chapter.title, chapter.time, chapter_duration, total_chapters, duration)
+        matches_info[i] = {
+            is_match = is_match,
+            match_type = match_type,
+            category = category,
+            time = chapter.time,
+            chapter = chapter,
+            chapter_duration = chapter_duration,
+        }
+    end
+
+    -- If multiple opening/preview matches exist within intro_time_window, prefer the second one
+    local intro_candidates = {}
+    for i, info in ipairs(matches_info) do
+        if info and info.is_match and info.time and info.time < o.intro_time_window then
+            -- consider opening/preview matches or position-based opening
+            if info.category == "opening" or info.category == "preview" or info.match_type == "position-opening" then
+                table.insert(intro_candidates, i)
+            end
+        end
+    end
+    if #intro_candidates >= 2 then
+        table.sort(intro_candidates, function(a, b) return a < b end)
+        local chosen = intro_candidates[2]
+        for _, idx in ipairs(intro_candidates) do
+            if idx ~= chosen and matches_info[idx] then
+                matches_info[idx].is_match = false
+            end
+        end
+    end
+
+    for i, info in ipairs(matches_info) do
+        if info and not skipped[i] and info.is_match then
             if i == current + 1 then
                 skipped[i] = true
                 local skip_time = chapters[i + 1] and chapters[i + 1].time or mp.get_property_native("duration")
                 add_active_skip({
-                    start = chapter.time,
+                    start = chapters[i].time,
                     ended = skip_time,
-                    title = chapter.title,
+                    title = chapters[i].title,
+                    category = info.category,
                 })
             end
         end
@@ -579,6 +901,8 @@ local function check_skip()
     local file_ext = filename:lower():match("%.([^%.]+)$") or ""
     local title = mp.get_property_native("media-title"):gsub("%.[^%.]+$", "")
     local dir = get_parent_dir(path)
+
+    if duration <= o.intro_time_window then return end
 
     if is_protocol(filename) then
         title = url_decode(title)
@@ -601,6 +925,9 @@ local function check_skip()
     local fname = file_history.fname
     local fname_ext = fname:lower():match("%.([^%.]+)$") or ""
 
+    -- Check if it's the same file or a different file in the same directory
+    local is_same_file = (fname == filename)
+
     if (not is_protocol(path) and file_ext ~= fname_ext) or
     (fname ~= filename and not compare_filenames(fname, filename)) then
         return
@@ -610,29 +937,52 @@ local function check_skip()
 
     if next(skip_list) == nil then return end
     if next(chapters) == nil then
+        -- No chapters: check if we should apply history
+        if not o.enable_history_position_inference and not is_same_file then
+            return  -- Skip history for non-chapter files when disabled and not the same file
+        end
+
+        -- Apply history with category inference (if enabled or same file)
         for _, s in ipairs(skip_list) do
-            add_active_skip(s)
+            local category = nil
+            if s.start < o.intro_time_window then
+                category = "opening"
+            elseif duration > 0 and s.start >= (duration - o.outro_time_window) then
+                category = "ending"
+            end
+            add_active_skip({
+                start = s.start,
+                ended = s.ended,
+                title = s.title,
+                category = category
+            })
         end
         return
     end
 
     local used_chapters = {}
     for _, s in ipairs(skip_list) do
-        local matched = false
         for i, chapter in ipairs(chapters) do
             if not used_chapters[i] then
                 local start_time = chapter.time
                 local end_time   = chapters[i + 1] and chapters[i + 1].time or duration
                 if math.abs((end_time - start_time) - (s.ended - s.start)) <= 0.05 then
-                    matched = true
                     used_chapters[i] = true
-                    add_active_skip({ start = start_time, ended = end_time })
+                    -- Infer category for chapter-matched skips
+                    local category = nil
+                    if start_time < o.intro_time_window then
+                        category = "opening"
+                    elseif duration > 0 and start_time >= (duration - o.outro_time_window) then
+                        category = "ending"
+                    end
+                    add_active_skip({
+                        start = start_time,
+                        ended = end_time,
+                        category = category
+                    })
                     break
                 end
             end
-        end
-        if not matched then
-            add_active_skip(s)
         end
     end
     if skip then
@@ -663,13 +1013,16 @@ mp.observe_property('percent-pos', 'number', function(_, value)
 end)
 
 mp.add_hook('on_unload', 10, function()
-    if confirm_timer then
+    if button_state.visible then
         cancel_skip_prompt()
+    end
+    if skip_timer then
+        skip_timer:kill()
+        skip_timer = nil
     end
     if chapter_skip and next(chapter_skip) ~= nil then
         write_history(mp.get_property("path"))
     end
-    skip_timer = nil
     state = {}
     parsed = {}
     skipped = {}
